@@ -60,7 +60,7 @@ Sample output:
 ok    kernel driver: 0000:01:00.0 uses amdgpu
 ok    Vulkan 64-bit: AMD Radeon Pro 580X (RADV POLARIS10)
 ok    Vulkan 32-bit: /usr/lib32/libvulkan_radeon.so
-ok    VA-API: Mesa Gallium driver … (radeonsi, …), N decode profiles
+ok    VA-API: Mesa Gallium driver 26.2.2-arch1.1 for AMD Radeon Pro 580X (radeonsi, polaris10, ACO, DRM 3.64, 7.2.5-3-omarchy), 11 decode profiles
 ok    Vulkan ICD files: all point to existing libraries
 ok    kernel log: no amdgpu errors this boot
 ```
