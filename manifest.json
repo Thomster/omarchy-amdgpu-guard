@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "amdgpu-guard",
+  "name": "AMDGPU Guard",
+  "version": "1.0.0",
+  "author": "Claude Code / Thomas Alt",
+  "description": "Checks the AMD graphics stack (amdgpu kernel driver, RADV Vulkan 64/32-bit, VA-API via vainfo, dangling Vulkan ICDs, amdgpu kernel errors) and notifies you once per boot if something is broken. No bar icon.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

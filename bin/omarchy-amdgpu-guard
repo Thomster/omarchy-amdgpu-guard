@@ -1,0 +1,183 @@
+#!/bin/bash
+# omarchy-amdgpu-guard
+#
+# Read-only health check of the AMD graphics stack: kernel driver, Vulkan
+# (64- and 32-bit), VA-API video decoding, and leftovers from other
+# vendors' drivers. Built after removing the NVIDIA userspace drivers that
+# Steam had pulled onto an iMac19,1 (Radeon Pro 580X), to confirm the AMD
+# side was untouched -- and to notice if a later update breaks it.
+#
+# Checks, all of them run (no stop at the first failure):
+#
+#   1. amdgpu kernel driver bound to every AMD GPU (PCI vendor 0x1002,
+#      class 0x03). No AMD GPU at all -> exit 0, nothing to guard.
+#   2. Vulkan, 64-bit: vulkaninfo lists a RADV device.
+#   3. Vulkan, 32-bit (Steam/Proton): only if lib32-vulkan-icd-loader is
+#      installed. There is no 32-bit vulkaninfo on Arch, so this checks
+#      that the 32-bit RADV library exists and an ICD file points to it.
+#   4. VA-API: vainfo on the GPU's render node uses the Mesa radeonsi
+#      driver and offers at least one decode profile.
+#   5. Vulkan ICD files: every one points to a library that exists. A
+#      dangling ICD (e.g. nvidia_icd.json without nvidia-utils) makes
+#      some games and launchers pick a dead driver.
+#   6. Kernel log of this boot: no amdgpu errors (ring timeouts, GPU
+#      resets, failed firmware loads). Skipped if the journal isn't
+#      readable for this user.
+#
+# Usage:
+#   omarchy-amdgpu-guard [--check] [--quiet]
+#     exit 0 = all checks passed (or no AMD GPU)
+#     exit 1 = at least one check failed (details on stdout)
+#     exit 3 = checks passed, but some were skipped: vainfo / vulkaninfo
+#              missing (pacman -S libva-utils vulkan-tools)
+#
+# Never changes anything and needs no root.
+
+set -uo pipefail
+
+QUIET=0
+
+usage() {
+  sed -n '/^# Usage:/,/^# Never/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) ;;
+    --quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+FAILED=0
+SKIPPED=0
+
+ok()   { (( QUIET )) || echo "ok    $*"; }
+fail() { (( QUIET )) || echo "FAIL  $*"; FAILED=1; }
+skip() { (( QUIET )) || echo "skip  $*"; SKIPPED=1; }
+
+# PCI addresses of AMD display controllers.
+amd_gpus() {
+  local dev
+  for dev in /sys/bus/pci/devices/*; do
+    [[ "$(cat "$dev/vendor" 2>/dev/null)" == 0x1002 ]] || continue
+    [[ "$(cat "$dev/class" 2>/dev/null)" == 0x03* ]] || continue
+    basename "$dev"
+  done
+}
+
+mapfile -t GPUS < <(amd_gpus)
+if (( ${#GPUS[@]} == 0 )); then
+  (( QUIET )) || echo "No AMD GPU found. Nothing to check."
+  exit 0
+fi
+
+# 1. Kernel driver
+RENDER_NODE=""
+for gpu in "${GPUS[@]}"; do
+  driver="$(basename "$(readlink "/sys/bus/pci/devices/$gpu/driver" 2>/dev/null)" 2>/dev/null)"
+  if [[ "$driver" == amdgpu ]]; then
+    ok "kernel driver: $gpu uses amdgpu"
+    if [[ -z "$RENDER_NODE" ]]; then
+      node="$(ls "/sys/bus/pci/devices/$gpu/drm" 2>/dev/null | grep -m1 '^renderD')"
+      [[ -n "$node" ]] && RENDER_NODE="/dev/dri/$node"
+    fi
+  else
+    fail "kernel driver: $gpu uses '${driver:-none}' instead of amdgpu"
+  fi
+done
+
+# 2. Vulkan, 64-bit
+if command -v vulkaninfo >/dev/null; then
+  radv="$(vulkaninfo --summary 2>/dev/null | sed -n 's/^[[:space:]]*deviceName[[:space:]]*= \(.*RADV.*\)$/\1/p' | head -1)"
+  if [[ -n "$radv" ]]; then
+    ok "Vulkan 64-bit: $radv"
+  else
+    fail "Vulkan 64-bit: no RADV device in vulkaninfo (vulkan-radeon installed?)"
+  fi
+else
+  skip "Vulkan 64-bit: vulkaninfo not installed (vulkan-tools)"
+fi
+
+# Library a Vulkan ICD file points to, resolved like the loader does for
+# a bare name: /usr/lib for 64-bit, /usr/lib32 for 32-bit.
+icd_library() {
+  sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
+ICD_FILES=()
+for dir in /usr/share/vulkan/icd.d /etc/vulkan/icd.d; do
+  for icd in "$dir"/*.json; do
+    [[ -f "$icd" ]] && ICD_FILES+=("$icd")
+  done
+done
+
+# 3. Vulkan, 32-bit
+if pacman -Qq lib32-vulkan-icd-loader >/dev/null 2>&1; then
+  found=""
+  for icd in "${ICD_FILES[@]}"; do
+    lib="$(icd_library "$icd")"
+    [[ "$lib" == *vulkan_radeon* ]] || continue
+    if [[ "$lib" == /* ]]; then
+      [[ "$lib" == /usr/lib32/* && -f "$lib" ]] && found="$lib"
+    elif [[ -f "/usr/lib32/$lib" ]]; then
+      found="/usr/lib32/$lib"
+    fi
+  done
+  if [[ -n "$found" ]]; then
+    ok "Vulkan 32-bit: $found"
+  else
+    fail "Vulkan 32-bit: no 32-bit RADV driver (install lib32-vulkan-radeon)"
+  fi
+else
+  ok "Vulkan 32-bit: not needed (no lib32-vulkan-icd-loader)"
+fi
+
+# 4. VA-API
+if ! command -v vainfo >/dev/null; then
+  skip "VA-API: vainfo not installed (libva-utils)"
+elif [[ -z "$RENDER_NODE" ]]; then
+  fail "VA-API: no render node for the AMD GPU"
+else
+  out="$(vainfo --display drm --device "$RENDER_NODE" 2>&1)"
+  rc=$?
+  drv="$(sed -n 's/.*Driver version: //p' <<<"$out" | head -1)"
+  profiles="$(grep -c 'VAEntrypointVLD' <<<"$out")"
+  if (( rc == 0 )) && [[ "$drv" == *radeonsi* ]] && (( profiles > 0 )); then
+    ok "VA-API: $drv, $profiles decode profiles"
+  else
+    fail "VA-API: vainfo failed or no radeonsi decode profiles (${drv:-no driver}); run: vainfo --display drm --device $RENDER_NODE"
+  fi
+fi
+
+# 5. Dangling Vulkan ICD files
+dangling=0
+for icd in "${ICD_FILES[@]}"; do
+  lib="$(icd_library "$icd")"
+  [[ -n "$lib" ]] || continue
+  if [[ "$lib" == /* ]]; then
+    [[ -f "$lib" ]] && continue
+  else
+    [[ -f "/usr/lib/$lib" || -f "/usr/lib32/$lib" ]] && continue
+  fi
+  fail "Vulkan ICD $icd points to missing library $lib (owner: $(pacman -Qoq "$icd" 2>/dev/null || echo none))"
+  dangling=1
+done
+(( dangling )) || ok "Vulkan ICD files: all point to existing libraries"
+
+# 6. Kernel log of this boot
+if journalctl -k -b -n 1 -q >/dev/null 2>&1 && [[ -n "$(journalctl -k -b -n 1 -q 2>/dev/null)" ]]; then
+  errors="$(journalctl -k -b -p 3 -q --no-pager -o cat 2>/dev/null | grep -i 'amdgpu' )"
+  if [[ -z "$errors" ]]; then
+    ok "kernel log: no amdgpu errors this boot"
+  else
+    fail "kernel log: $(wc -l <<<"$errors") amdgpu error(s) this boot, first: $(head -1 <<<"$errors")"
+  fi
+else
+  skip "kernel log: journal not readable for $(id -un)"
+fi
+
+(( FAILED )) && exit 1
+(( SKIPPED )) && exit 3
+exit 0
